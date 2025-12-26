@@ -1,0 +1,69 @@
+---
+title: "Unificación de datos"
+author: "Sheila Santomé"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Unificar sets de datos:
+
+Se cargan dos datasets provenientes de diferentes fuentes: `results_GEO` (de GEO) y `results_UCSC` (de UCSC Xena). Ambos contienen información de expresión génica para melanoma, incluyendo identificadores de genes y comparaciones entre condiciones. Puede ser posible que las rutas de los archivos se vea modificada al querer leer los archivos; además, de querer incluir mas datasets, será necesario incluir otra variable.
+
+```{r}
+
+library(dplyr)
+
+results_GEO <- readRDS("results_GEO_Melanoma.rds")
+results_UCSC<- readRDS("results_UCSC_Xena_Melanoma.rds")
+
+# Obtener todos los nombres de columnas que deben existir
+all_cols <- union(names(results_UCSC), names(results_GEO))
+
+all_cols
+```
+
+Las columnas `GENENAME` y `ENSEMBL` se convierten a tipo carácter para evitar problemas al unir los datasets, ya que algunas funciones de unión requieren que las columnas clave tengan el mismo tipo de datos. Se detectan las columnas que están presentes en un dataset pero no en el otro y se agregan con valores por defecto (0). Esto garantiza que ambos datasets tengan las mismas columnas, facilitando la combinación posterior. Se reordenan las columnas para que coincidan en ambos datasets y luego se utiliza bind_rows para unirlos por filas, conservando todas las columnas y todas las observaciones de ambos datasets.
+
+```{r}
+
+results_UCSC$GENENAME <- as.character(results_UCSC$GENENAME)
+results_GEO$GENENAME <- as.character(results_GEO$GENENAME)
+results_UCSC$ENSEMBL <- as.character(results_UCSC$ENSEMBL)
+results_GEO$ENSEMBL  <- as.character(results_GEO$ENSEMBL)
+
+# Columnas que faltan en df1
+missing_df1 <- setdiff(all_cols, names(results_UCSC))
+# Columnas que faltan en df2
+missing_df2 <- setdiff(all_cols, names(results_GEO))
+
+# Crear las columnas faltantes con 0
+results_UCSC[missing_df1] <- 0
+results_GEO[missing_df2] <- 0
+
+# Reordenar columnas para que coincidan
+df1 <- results_UCSC[, all_cols]
+df2 <- results_GEO[, all_cols]
+
+# Unir por filas
+df_combined <- bind_rows(df1, df2)
+```
+
+\
+Se eliminan filas duplicadas basándose en las columnas `Comparison` y `Gene`. Se mantiene el resto de la información con `.keep_all = TRUE` para asegurar que no se pierda información relevante.
+
+```{r}
+
+df_combined <- df_combined %>%  distinct(Comparison, Gene, .keep_all = TRUE)
+```
+
+Finalmente, el dataset combinado se guarda como archivo `.rds` (`data_Melanoma.rds`). Este archivo puede ser cargado posteriormente para análisis adicionales o para alimentar aplicaciones Shiny, evitando tener que repetir todo el proceso de unificación.
+
+```{r}
+
+saveRDS(df_combined, file = "./Gene_Searcher/data_Melanoma.rds")
+```

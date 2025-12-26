@@ -1,0 +1,651 @@
+---
+title: "Untitled"
+author: "Sheila Santomé"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# **Introducción**
+
+Este notebook detalla el proceso completo de análisis de datos de RNA-Seq , incluyendo datos de metástasis obtenidos desde [cBioPortal](https://www.cbioportal.org/)y datos de tumores primarios procedentes del proyecto [TCGA-SKCM](https://xenabrowser.net/datapages/?cohort=GDC%20TCGA%20Melanoma%20(SKCM)&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443). El objetivo es comparar la expresión génica entre los tumores primarios y los distintos tipos de metástasis, realizar análisis diferencial y generar una tabla final completamente anotada, con información funcional y estadísticas descriptivas por tipo de tejido.
+
+## Cargar librerías
+
+```{r instalar librerías}
+# Instalar BiocManager si no está presente
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# --- Librerías de Bioconductor ---
+bioc_pkgs <- c(
+    "AnnotationDbi",
+    "biomaRt",
+    "DESeq2",
+    "KEGGREST",
+    "limma",
+    "org.Hs.eg.db",
+    "reactome.db",
+    "SummarizedExperiment",
+    "TCGAbiolinks"
+)
+
+for (pkg in bioc_pkgs) {
+    if (!require(pkg, character.only = TRUE)) {
+        BiocManager::install(pkg, ask = FALSE)
+    }
+}
+
+# --- Librerías de CRAN ---
+cran_pkgs <- c(
+    "dplyr",
+    "stringr",
+    "tibble",
+    "EnhancedVolcano",
+    "UCSCXenaTools"
+)
+
+for (pkg in cran_pkgs) {
+    if (!require(pkg, character.only = TRUE)) {
+        install.packages(pkg)
+    }
+}
+```
+
+```{r cargar las librerías}
+
+library(AnnotationDbi)
+library(biomaRt)
+library(DESeq2)
+library(dplyr)
+library(EnhancedVolcano)
+library(KEGGREST)
+library(limma)
+library(org.Hs.eg.db)
+library(reactome.db)
+library(stringr)
+library(SummarizedExperiment)
+library(tibble)
+library(TCGAbiolinks)
+library(UCSCXenaTools)
+
+```
+
+# Dataset de Metástasis de cBioportal:
+
+En esta notebook se utilizan datos de [cBioPortal](https://www.cbioportal.org/), concretamente del estudio **Metastatic Melanoma (DFCI, Nature Medicine 2019)**. Los datos se descargaron directamente desde la plataforma en un archivo comprimido (.zip). La información correspondiente al experimento de **RNA-Seq** se cargó en el entorno mediante el bloque de código que se muestra a continuación. Para analizar datos de un estudio diferente, será necesario reemplazar las rutas para los archivos con la correspondiente al nuevo experimento.
+
+```{r cargar archivos}
+
+rna <- read.delim("./mel_dfci_2019/data_mrna_seq_tpm.txt", comment.char = "#", stringsAsFactors = FALSE)
+
+clinical <- read.delim("./mel_dfci_2019/mel_dfci_2019/data_clinical_patient.txt", comment.char = "#", stringsAsFactors = FALSE)
+
+samples  <- read.delim("./mel_dfci_2019/mel_dfci_2019/data_clinical_sample.txt", comment.char = "#", stringsAsFactors = FALSE)
+
+```
+
+El dataset original identifica los genes mediante símbolos *HUGO*. Para integrar correctamente estos datos con otros estudios y anotaciones génicas, es necesario convertirlos a identificadores **ENSEMBL**. Para ello, se establece una conexión con Ensembl utilizando *biomaRt* y se genera una tabla de equivalencias que posteriormente se une al dataset de expresión.
+
+```{r cambiar a ENSEMBL ID}
+
+# Conectar con la base de datos de genes humanos en Ensembl
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Obtener tabla de conversión
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  mart = ensembl
+)
+```
+
+```{r mapear}
+
+df_annot <- rna %>%
+  left_join(gene_map, by = c("Hugo_Symbol" = "hgnc_symbol"))
+
+df_annot <- df_annot %>%
+  dplyr::select(1, ensembl_gene_id, everything())
+
+df_annot$Hugo_Symbol <- NULL
+df_annot$Entrez_Gene_Id <- NULL
+
+df_annot
+```
+
+# Añadir tipo de metastasis
+
+Esta sección organiza las muestras según el tejido en el que se originó la metástasis. Para ello, se utiliza la columna *`BIOPSY_SITE_CATEG`* del archivo clínico y se agrupan las muestras en categorías como: piel, cerebro, nodos linfáticos, hígado, pulmón, entre otros. Tanto la columna donde se encuentra el tipo de muestra como el nombre de las misma puede variar dependiendo del dataset.
+
+```{r}
+
+samples$sample_group <- case_when(
+  samples$BIOPSY_SITE_CATEG %in% c("skin") ~ "Met_Skin",
+  samples$BIOPSY_SITE_CATEG == "brain" ~ "Met_Brain",
+  samples$BIOPSY_SITE_CATEG == "lymph node" ~ "Met_Lymph",
+  samples$BIOPSY_SITE_CATEG == "liver/visceral" ~ "Met_Liver",
+  samples$BIOPSY_SITE_CATEG == "soft tissue" ~ "Met_Tissue",
+  samples$BIOPSY_SITE_CATEG == "lung" ~ "Met_Lung",
+  samples$BIOPSY_SITE_CATEG == "bone" ~ "Met_Bone",
+  TRUE ~ NA_character_
+)
+```
+
+A continuación, se eliminan genes sin identificador ENSEMBL y se suman los valores de expresión duplicados para garantizar una única fila por gen. El resultado se transforma en una matriz cuya estructura permitirá la posterior combinación con los datos de TCGA.
+
+```{r}
+
+# Filtrar NA 
+samples <- samples %>%
+  filter(!is.na(sample_group))
+
+df_annot_unique <- df_annot %>%
+  dplyr::filter(!is.na(ensembl_gene_id)) %>%
+  group_by(ensembl_gene_id) %>%
+  summarize(across(where(is.numeric), sum), .groups = "drop")
+
+# Convertir a matriz con rownames
+df_matrix <- as.matrix(df_annot_unique[, -1])        
+rownames(df_matrix) <- df_annot_unique$ensembl_gene_id
+
+# Filtrar solo las columnas de las muestras
+common_samples <- intersect(colnames(df_matrix), samples$SAMPLE_ID)
+df_matrix <- df_matrix[, common_samples, drop = FALSE]
+
+# Comprobar resultado
+table(samples$sample_group)
+```
+
+# Normalizar conteos
+
+Los datos de cBioPortal se encuentran en TPM, por lo que se aplica una transformación log2(TPM + 1) para estabilizar la varianza y permitir comparaciones más robustas entre muestras.
+
+```{r Log2}
+
+df_log2 <- log2(df_matrix + 1)
+
+```
+
+# Dataset de Tumor Primario
+
+Para comparar los datos de metástasis del dataset de Bioportal con tumores primarios, se descarga el dataset `TCGA-SKCM` desde UCSC Xena. Se obtienen tanto los datos de expresión como la información clínica. Posteriormente, se armonizaran los identificadores de muestra y se seleccionan únicamente las muestras correspondientes a tumores primarios. El pipeline seguido es el mismo que el de la notebook `UCSC_Xena.Rmd.`
+
+```{r buscara datasets}
+
+data(XenaData)
+
+# Buscar datasets asociados al melanoma (TCGA-SKCM)
+xena_datasets <- XenaData %>%
+  dplyr::filter(grepl("TCGA-SKCM", XenaDatasets)) %>%
+  dplyr::select(XenaDatasets, XenaCohorts, DataSubtype, Type, XenaHostNames)
+
+
+xena_datasets
+
+```
+
+```{r descargar datos}
+
+url <- "https://xenabrowser.net/datapages/"
+try(httr::GET(url))
+
+data(XenaData)
+options(timeout = 600)
+
+
+# Elegir archivos
+dataset_expr <- "TCGA-SKCM.star_tpm.tsv"
+dataset_clin <- "TCGA-SKCM.GDC_phenotype.tsv"
+
+# Descargar
+expr_obj <- XenaGenerate(subset = XenaDatasets == dataset_expr) %>%
+  XenaQuery() %>%
+  XenaDownload()
+
+clin_obj <- XenaGenerate(subset = XenaDatasets == dataset_clin) %>%
+  XenaQuery() %>%
+  XenaDownload()
+
+# Preparar datos
+expr <- XenaPrepare(expr_obj)
+clin <- XenaPrepare(clin_obj)
+
+```
+
+```{r crear los objetos}
+
+expr_mat <- as.data.frame(expr)
+clin_df <- as.data.frame(clin)
+
+head(colnames(expr_mat))
+head(clin_df$submitter_id.samples)
+```
+
+```{r obtener ids}
+
+expr_ids <- substr(colnames(expr_mat), 1, 15)
+clin_ids <- substr(clin_df$submitter_id.samples, 1, 15)
+
+common_samples <- intersect(expr_ids, clin_ids)
+length(common_samples)
+head(common_samples)
+
+```
+
+```{r limpiar los objetos}
+
+# Establecer los IDs recortados como definitivos
+colnames(expr_mat) <- substr(colnames(expr_mat), 1, 15)
+clin_df$submitter_id.samples <- substr(clin_df$submitter_id.samples, 1, 15)
+
+# Filtrar y alinear según las muestras comunes
+expr_mat <- expr_mat[, c("Ensembl_ID", common_samples)]
+rownames(expr_mat) <- expr_mat$Ensembl_ID
+expr_mat$Ensembl_ID <- NULL
+clin_df <- clin_df[match(common_samples, clin_df$submitter_id.samples), ]
+
+# Comprobar
+dim(expr_mat)
+dim(clin_df)
+all(colnames(expr_mat) == clin_df$submitter_id.samples)
+
+```
+
+En caso de estar trabajando con otro dataset puede ser necesario cambiar la columna de identificador de tipo de muestra (`sample_type.samples`) o la agrupación de las muestras.
+
+```{r definir muestras}
+
+clin_df$sample_group <- case_when(
+  clin_df$sample_type.samples %in% c("Metastatic") ~ "Metastatic",
+  clin_df$sample_type.samples == "Primary Tumor" ~ "Primary.Tumor",
+  clin_df$sample_type.samples == "Solid Tissue Normal" ~ "Solid.Tissue.Normal",
+  TRUE ~ NA_character_
+)
+
+```
+
+A continuación se seleccionan solo las muestras de tumor primario.
+
+```{r filtar muestras}
+
+# Eliminar NA
+clin_df <- clin_df %>%
+  filter(sample_group == "Primary.Tumor")
+
+#Sincronizar matriz de expresión y metadata
+expr_mat <- expr_mat[, clin_df$submitter_id.sample, drop = FALSE]
+
+# Comprobar resultado
+table(clin_df$sample_group)
+
+#Eliminar la versión de los ID de los genes
+rownames(expr_mat) <- sub("\\.[0-9]+$", "", rownames(expr_mat))
+
+```
+
+# Juntar datasets
+
+En esta sección, se unifican los nombres de las muestras entre ambos datasets para asegurar que la matriz de expresión y la información clínica estén correctamente sincronizadas. Esto permite identificar los genes comunes en ambos datasets y combinarlos en una única matriz global para el análisis diferencial.
+
+## Crear la matriz de expresión
+
+```{r genes comunes}
+
+genes1 <- rownames(df_log2)
+genes2 <- rownames(expr_mat)
+
+genes_comunes <- intersect(genes1, genes2)
+length(genes_comunes)
+
+```
+
+```{r matriz de expresión conjunta}
+
+expr1_common <- df_log2[genes_comunes,, drop = FALSE]
+
+expr2_common <- expr_mat[genes_comunes, , drop = FALSE]
+
+expr_mat_merged <- cbind(expr1_common, expr2_common)
+
+expr_mat_merged
+
+```
+
+## Crear metadata
+
+Se construye un dataframe de metadatos que incluya para cada muestra su identificador y su categoría (*Met_Skin*, *Met_Brain*, *Primary.Tumor*, etc.). Este objeto es esencial para generar los modelos estadísticos del análisis diferencial. Para crear el objeto de metadata, seleccionamos las columnas del id de la muestra (`SAMPLE_ID`) y el grupo al que pertenece la muestra (`sample_group`). La columna en la que están los IDs de la muestra puede variar dependiendo del dataset
+
+```{r subsets metada}
+
+meta1_sub <- samples %>% dplyr::select(SAMPLE_ID, sample_group)
+meta2_sub <- clin_df %>% dplyr::select(submitter_id.samples, sample_group)
+
+```
+
+```{r metadata combinada}
+
+colnames(meta2_sub) <- make.names(colnames(meta2_sub))
+meta2_sub <- meta2_sub %>% dplyr::rename(SAMPLE_ID = submitter_id.samples)
+
+metadata_combined <- bind_rows(meta1_sub, meta2_sub)
+
+metadata_combined <- metadata_combined %>%
+  dplyr::filter(SAMPLE_ID %in% colnames(expr_mat_merged))
+
+```
+
+## Guardar objetos:
+
+En caso de querer guardar los datos combinados se ejecutará el siguiente bloque de código.
+
+```{r guardar objetos}
+
+saveRDS(expr_mat_merged, file = "expr_mat_merged.rds")
+saveRDS(metadata_combined, file = "metadata_merged.rds")
+
+```
+
+# Análisis diferencial:
+
+Se define un modelo lineal para comparar cada tipo de metástasis frente al tumor primario utilizando la librería **limma**. Se genera una matriz de contrastes donde cada comparación representa un tejido metastásico contra los tumores primarios. El resultado consiste en tablas para cada comparación con valores de logFC, p-value y p-value ajustado.
+
+```{r}
+
+unique(metadata_filtered$sample_group)
+
+```
+
+A la hora de hacer las comparaciones, buscaremos comparar un tipo concreto de metástasis con las muestras de tumor primario. Los niveles pueden verse modificados dependiendo del dataset.
+
+```{r grupos}
+
+group <- factor(
+  metadata_filtered$sample_group,
+  levels = c("Met_Skin","Met_Brain",
+             "Met_Liver","Met_Lymph",
+             "Met_Tissue","Met_Lung",
+             "Met_Bone","Primary.Tumor")
+)
+
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+```
+
+En caso de querer analizar otras combinaciones o de estar trabajando con otro dataset será necesario modificar la matriz de contrastes.
+
+```{r hacer contrastes}
+
+contrast_matrix <- makeContrasts(
+  Met_Skin_vs_Tumor = Met_Skin - Primary.Tumor,
+  Met_Brain_vs_Tumor = Met_Brain - Primary.Tumor,
+  Met_Liver_vs_Tumor = Met_Liver - Primary.Tumor,
+  Met_Lymph_vs_Tumor  = Met_Lymph - Primary.Tumor,
+  Met_Tissue_vs_Tumor = Met_Tissue - Primary.Tumor,
+  Met_Lung_vs_Tumor  = Met_Lung - Primary.Tumor,
+  Met_Bone_vs_Tumor  = Met_Bone - Primary.Tumor,
+  levels = design
+)
+
+fit <- lmFit(expr_mat_merged, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+```
+
+En el caso de haber modificado la matriz de resultados, será necesario modificar el vector de comparaciones.
+
+```{r resultados}
+
+# Vector de comparaciones
+comparisons <- c("Met_Skin_vs_Tumor",
+                 "Met_Brain_vs_Tumor",
+                 "Met_Liver_vs_Tumor",
+                 "Met_Tissue_vs_Tumor",
+                 "Met_Lung_vs_Tumor",
+                 "Met_Lymph_vs_Tumor",
+                 "Met_Bone_vs_Tumor")
+
+# Función para generar topTable filtrado y con columna ENSEMBL
+process_comparison <- function(comp, fit) {
+  topTable(fit, coef = comp, number = Inf) %>%
+    mutate(Comparison = comp) %>%
+    filter(abs(logFC) >= 1, adj.P.Val < 0.05) %>%
+    rownames_to_column("ENSEMBL")
+}
+
+# Lista de resultados filtrados
+res_list <- lapply(comparisons, process_comparison, fit = fit2)
+
+# Combinar todos en un solo data.frame
+res <- bind_rows(res_list)
+
+```
+
+A continuación, se añadirá una columna con el tipo de cáncer, con el fin de poder agrupar los resultados de distintos tipos de cáncer en un mismo archivo. Actualmente, la aplicación **Gene Searcher** trabaja con archivos separados para cada tipo de cáncer, por lo que no es estrictamente necesario ejecutar este bloque. No obstante, es recomendable incluir esta columna para mantener identificados los datos, especialmente en caso de que el archivo guardado no tenga el nombre correcto.
+
+```{r añadir tipo de cancer}
+
+res$cancer_type <- "Melanoma"
+
+```
+
+# Añadir información estadística
+
+En esta sección se incorporarán varias columnas adicionales al *data frame* de resultados, que representarán la media de expresión, la mediana y la desviación estándar para cada gen en las diferentes muestras. Esta información permitirá en Gene Searcher generar gráficos comparativos de expresión para genes individuales.
+
+Al igual que en el análisis funcional, es importante diferenciar el tipo de datos con los que se está trabajando. Aunque el procedimiento es el mismo para ambos tipos de datos, el **identificador del estadístico** varía, lo cual será necesario tener en cuenta para identificar correctamente los datos en gráficos y análisis posteriores.
+
+## Cálculo de estadístico con datos Log2 normalizados
+
+En el caso de los datos de melanoma con los que se está trabajandoen esta notebook se calcularán estas estadísticas
+
+```{r subset}
+
+# Filtrar y reordenar según res$ENSEMBL, respetando duplicados
+expr_subset <- expr_mat_merged[rownames(expr_mat_merged) %in% res$ENSEMBL, , drop = FALSE]
+expr_subset <- expr_subset[match(res$ENSEMBL, rownames(expr_subset)), , drop = FALSE]
+
+# Añadir la columna ENSEMBL para mantener el identificador
+expr_subset <- cbind(ENSEMBL = res$ENSEMBL, expr_subset)
+
+# Comprobación segura: todas las filas están presentes
+all(expr_subset$ENSEMBL %in% rownames(expr_mat_merged))
+
+expr_subset$ENSEMBL <- NULL
+
+
+```
+
+Para el cálculo de los estadísticos será necesario modificar el nombre de cada columna de acuerod al tipo de la muestra y el `sample_group` .
+
+### Cálculo de la media
+
+```{r media}
+
+# Ahora calcular las medias por grupo, solo para esos genes
+res$expr_Tumor_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Primary.Tumor", drop = FALSE], na.rm = TRUE)
+
+res$expr_Met_Skin_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Met_Skin", drop = FALSE], na.rm = TRUE)
+
+res$expr_Met_Brain_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Met_Brain", drop = FALSE], na.rm = TRUE)
+
+res$expr_Met_Liver_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Met_Liver", drop = FALSE], na.rm = TRUE)
+
+res$expr_Met_Lymph_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Met_Lymph", drop = FALSE], na.rm = TRUE)
+
+res$expr_Met_Tissue_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Met_Tissue", drop = FALSE], na.rm = TRUE)
+
+res$expr_Met_Lung_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Met_Lung", drop = FALSE], na.rm = TRUE)
+
+res$expr_Met_Bone_mean <- rowMeans(expr_subset[, metadata_filtered$sample_group == "Met_Bone", drop = FALSE], na.rm = TRUE)
+```
+
+### Cálculo de la mediana
+
+```{r mediana}
+
+res$expr_Tumor_median <- apply(expr_subset[, metadata_filtered$sample_group == "Primary.Tumor", drop = FALSE], 1, median, na.rm = TRUE)
+
+res$expr_Met_Skin_median <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Skin", drop = FALSE], 1, median, na.rm = TRUE)
+
+res$expr_Met_Brain_median <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Brain", drop = FALSE], 1, median, na.rm = TRUE)
+
+res$expr_Met_Liver_median <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Liver", drop = FALSE], 1, median, na.rm = TRUE)
+
+res$expr_Met_Tissue_median <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Tissue", drop = FALSE], 1, median, na.rm = TRUE)
+
+res$expr_Met_Lymph_median <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Lymph", drop = FALSE], 1, median, na.rm = TRUE)
+
+res$expr_Met_Lung_median <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Lung", drop = FALSE], 1, median, na.rm = TRUE)
+
+res$expr_Met_Bone_median <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Bone", drop = FALSE], 1, median, na.rm = TRUE)
+```
+
+### Calculo de la desviación estándar:
+
+```{r desviación estándar}
+
+res$expr_Tumor_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Primary.Tumor", drop = FALSE], 1, sd, na.rm = TRUE)
+
+res$expr_Met_Skin_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Skin", drop = FALSE], 1, sd, na.rm = TRUE)
+
+res$expr_Met_Brain_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Brain", drop = FALSE], 1, sd, na.rm = TRUE)
+
+res$expr_Met_Liver_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Liver", drop = FALSE], 1, sd, na.rm = TRUE)
+
+res$expr_Met_Tissue_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Tissue", drop = FALSE], 1, sd, na.rm = TRUE)
+
+res$expr_Met_Lymph_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Lymph", drop = FALSE], 1, sd, na.rm = TRUE)
+
+res$expr_Met_Lung_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Lung", drop = FALSE], 1, sd, na.rm = TRUE)
+
+res$expr_Met_Bone_sd <- apply(expr_subset[, metadata_filtered$sample_group == "Met_Bone", drop = FALSE], 1, sd, na.rm = TRUE)
+
+```
+
+# Anotación de los genes:
+
+En esta sección se incorpora información funcional y biológica a los genes diferencialmente expresados identificados en el análisis previo. El objetivo es contextualizar los resultados mediante la anotación de cada gen con su símbolo oficial, nombre descriptivo y las rutas metabólicas o procesos biológicos en los que participa. Esta integración permite interpretar de manera más profunda los cambios de expresión observados entre las muestras metastásicas y los tumores primarios, facilitando la identificación de posibles mecanismos moleculares implicados en la progresión de la metástasis.
+
+```{r columnas de res}
+
+colnames(res)
+```
+
+```{r anotaciones}
+
+annotations <- AnnotationDbi::select(org.Hs.eg.db,
+                                     keys = res$ENSEMBL,
+                                     keytype = "ENSEMBL", #modificar si se está                                         trabajando con otro tipo de keytype
+                                     columns = c("SYMBOL", "GENENAME", "PATH"))
+
+reactome_ann_genes <- AnnotationDbi::select( org.Hs.eg.db,
+                                       keys =  res$ENSEMBL,
+                                       keytype =  "ENSEMBL",
+                                       columns = c("ENTREZID")
+                                       )
+
+
+```
+
+```{r anotaciones}
+
+# GO annotation
+go_ann <- AnnotationDbi::select(org.Hs.eg.db,
+                                keys = res$ENSEMBL,
+                                keytype = "ENSEMBL",
+                                columns = c("GO", "ONTOLOGY"))
+
+# Reactome
+reactome_ann <- AnnotationDbi::select(reactome.db,
+                                      keys = reactome_ann_genes$ENTREZID,
+                                      keytype = "ENTREZID",
+                                      columns = c("PATHNAME"))
+
+```
+
+```{r unir anotaciones}
+
+# Unir SYMBOL + GENENAME
+annot_base <- annotations %>%
+  dplyr::select(ENSEMBL, SYMBOL, GENENAME) %>%
+  dplyr::distinct()
+
+# Añadir GO
+annot_go <- go_ann %>%
+  group_by(ENSEMBL) %>%
+  summarize(
+    GO_terms = paste(unique(GO), collapse = "; "),
+    GO_ontology = paste(unique(ONTOLOGY), collapse = "; "),
+    .groups = "drop"
+  )
+
+annot_base <- annot_base %>%
+  left_join(annot_go, by = "ENSEMBL")
+
+# Añadir Reactome
+annot_reactome <- reactome_ann %>%
+  group_by(ENTREZID) %>%
+  summarize(
+    Reactome_PATH = paste(unique(PATHNAME), collapse = "; "),
+    .groups = "drop"
+  )
+
+# Unir mediante ENTREZID → ENSEMBL
+reactome_full <- reactome_ann_genes %>%
+  dplyr::select(ENSEMBL, ENTREZID) %>%
+  dplyr::distinct() %>%
+  left_join(annot_reactome, by = "ENTREZID") %>%
+  dplyr::select(-ENTREZID)
+
+# Juntar todo en una tabla final
+annot_final <- annot_base %>%
+  left_join(reactome_full, by = "ENSEMBL")
+
+# Vista previa
+head(annot_final)
+```
+
+```{r unir anotaciones a resultados}
+
+annot_final_unique <- annot_final %>%
+  group_by(ENSEMBL) %>%
+  summarize(
+    SYMBOL = unique(SYMBOL)[1],
+    GENENAME = unique(GENENAME)[1],
+    GO_terms = paste(unique(GO_terms[!is.na(GO_terms)]), collapse = "; "),
+    GO_ontology = paste(unique(GO_ontology[!is.na(GO_ontology)]), collapse = "; "),
+    Reactome_PATH = paste(unique(Reactome_PATH[!is.na(Reactome_PATH)]), collapse = "; "),
+    .groups = "drop"
+  )
+
+res_mer <- res %>% left_join(annot_final_unique, by = "ENSEMBL") #Modificar dependiendo del keytipe
+
+# Verificar
+head(res_mer)
+```
+
+Finalmente, se añadirá el nombre del gen al *data frame* de resultados. Esto permitirá unificar los datos con otros conjuntos que no contengan el identificador de Ensembl y facilitará la búsqueda de genes utilizando tanto el nombre como el símbolo.
+
+```{r}
+
+colnames(res_mer)[colnames(res_mer) == "SYMBOL"] <- "Gene"
+colnames(res_mer)[colnames(res_mer) == "Genename"] <- "GENENAME"
+
+```
+
+# Guardar los resultados:
+
+Finalmente se guardará `res_mer` como un objecto r para poder acceder comodamente y seguir añadiendo información del resto de cánceres.
+
+```{r guardar objeto}
+
+saveRDS(res_mer, file = "data_metastasis_melanoma.rds")
+
+# Si se quiere guardar el archivo en la carpeta de Gen searcher, modificar el tipo de cácer después de data_ si se está trabajando con otro tipo
+saveRDS(res_mer, file = "./Gene_searcher/data_Metastasis_Melanoma.rds")
+```

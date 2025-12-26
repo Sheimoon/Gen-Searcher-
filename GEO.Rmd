@@ -1,0 +1,633 @@
+---
+title: "Descarga de datos Geo Database"
+author: "Sheila Santomé"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+En esta libreta se describe el protocolo seguido para el análisis de la **expresión diferencial** entre tumores primarios y metástasis, utilizando datos de [**GEO Database**](https://www.ncbi.nlm.nih.gov/geo/). Para ello, se descargará el conjunto de datos desde la plataforma GEO, se calcularán métricas de resumen como la media y la mediana de expresión, y se realizará un análisis funcional de las rutas metabólicas asociadas a los genes estudiados.
+
+## Instalar y cargar librerías
+
+```{r descargar paquetes}
+
+# Instalar BiocManager si no está instalado
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# --- Instalación de librerías de Bioconductor ---
+bioc_pkgs <- c(
+    "GEOquery",
+    "limma",
+    "Biobase",
+    "edgeR",
+    "org.Hs.eg.db",
+    "clusterProfiler",
+    "AnnotationDbi",
+    "KEGGREST",
+    "reactome.db"
+)
+
+for (pkg in bioc_pkgs) {
+    if (!require(pkg, character.only = TRUE)) {
+        BiocManager::install(pkg, ask = FALSE)
+    }
+}
+
+# --- Instalación de librerías CRAN ---
+cran_pkgs <- c(
+    "dplyr",
+    "tibble"
+)
+
+for (pkg in cran_pkgs) {
+    if (!require(pkg, character.only = TRUE)) {
+        install.packages(pkg)
+    }
+}
+
+
+```
+
+```{r cargar paquetes}
+
+library(GEOquery)
+library(limma)
+library(Biobase)
+library(dplyr)
+library(edgeR)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(KEGGREST)
+library(tibble)
+library(reactome.db)
+
+
+```
+
+# Descarga de datos
+
+En esta sección se descargarán los datos de [GEO](https://www.ncbi.nlm.nih.gov/geo/) que se quieran analizar. En este caso se trabajará con datos de Melanoma humano del paper *Multi-modal Omics Analysis of a Paediatric Melanoma Highlights Mechanisms Underlying Treatment Resistance*, con numero de acceso GSE286410. En caso de querer descargar otro dataset, será necesario cambiar el id de GEO.
+
+```{r geo id}
+
+geo_id <- "GSE286410"
+
+```
+
+Una vez se ha establecido el id del dataset, se procederá a descargar los datos.
+
+```{r descargar datos}
+
+# Esto descarga el conjunto de datos y lo convierte en un objeto ExpressionSet
+
+gset <- getGEO(geo_id, GSEMatrix = TRUE, AnnotGPL = FALSE)
+
+if (length(gset) > 1) {
+  gset <- gset[[1]]
+} else {
+  gset <- gset[[1]]
+}
+
+```
+
+```{r crear los objetos}
+
+expr_data <- exprs(gset)   # matriz de expresión génica
+pdata <- pData(gset)       # metadatos de las muestras
+
+dim(gset)          # dimensiones de la matriz de expresión
+head(exprs(gset))  # ver las primeras filas
+
+```
+
+Ese codigo puede devolver una matriz de expresión vacia, de ser asi debería de ejecutarse el siguiente bloque. En el que se pasa el enlace de los archivos de la web de GEO y se descargarán manualmente; las variables `url_qnorm` y `destfile` deben de modificarse de acorde a los datos con los que se esté trabajando.
+
+```{r}
+
+url_qnorm <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE286nnn/GSE286410/suppl/GSE286410_GeoMx_qnorm.txt.gz"
+destfile <- "GSE286410_GeoMx_qnorm.txt.gz"
+
+download.file(url_qnorm, destfile)
+
+```
+
+Una vez descargado el archivo, se procederá a leerlo en R. Se recomienda revisarlo previamente para asegurarse de que su organización coincide con la estructura que `read.table` espera. Si el formato difiere, será necesario ajustar el siguiente bloque de código antes de continuar.
+
+```{r generar la matriz de expresion}
+
+expr_data <- read.table(gzfile(destfile),
+                        header = TRUE,       # la primera fila son nombres de                                                     columnas
+                        sep = "",            # R puede separar por cualquier                                                      cantidad de espacios
+                        quote = "\"",        # las comillas son los delimitadores                                                 de texto
+                        row.names = 1,       # la primera columna son genes
+                        check.names = FALSE, # no modificar nombres de columnas
+                        stringsAsFactors = FALSE)
+
+dim(expr_data)   # verificar dimensiones
+head(expr_data)  # ver primeras filas
+```
+
+Si se comprueban los nombres de muestra de de `expr_data` y los de `pdata` no coinciden; esto se debe a que los metadatos tiene el id de GEO y los datos de expresión tienen el id original. Por lo que será necesario descargar de forma manual los metadatos.
+
+```{r descargar metadata}
+
+url_qnorm <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE286nnn/GSE286410/suppl/GSE286410_Annotation.txt.gz"
+destfile <- "GSE286410_Annotation.txt.gz"
+
+download.file(url_qnorm, destfile)
+
+```
+
+```{r generar metadata}
+
+destfile <- "GSE286410_Annotation.txt.gz"
+pdata <- read.table(gzfile(destfile),
+                        header = TRUE,       # la primera fila son nombres de                                                     columnas
+                        sep = "",            # R puede separar por cualquier                                                      cantidad de espacios
+                        quote = "\"",        # las comillas son los delimitadores                                                 de texto
+                        row.names = 1,       # la primera columna son genes
+                        check.names = FALSE, # no modificar nombres de columnas
+                        stringsAsFactors = FALSE)
+
+dim(pdata)   # verificar dimensiones
+head(pdata)  # ver primeras filas
+
+
+```
+
+```{r establecer los nombres de muestra como rownames}
+
+rownames(pdata) <- pdata$Sample_ID
+pdata$Sample_ID <- NULL  
+```
+
+# Definir categorías para el análisis
+
+En esta sección dividiremos el dataset en categorías dependiendo del tipo de muestra. Para ello, se emplea la columna `region` del dataframe con los metadatos (`pdata`), en caso de trabajar con otros sets de datos el nombre de la columna podría variar. En el caso de este set de datos , se divirán las muestras en 3 categorías: **Control** (piel y nodo linfático), **Tumor Primario** y **Metástasis**.
+
+```{r buscar categorías}
+
+unique(pdata$region)
+```
+
+```{r definir categorías}
+
+pdata <- pdata %>%
+  mutate(
+    sample_group = case_when(
+      region == "Primary" ~ "Primary.Tumor",
+      region == "Skin" ~ "Skin.Control",
+      region == "Lymph_node" & pathology == "Affected" ~ "Metastatic",
+      region == "Lymph_node" & pathology == "Healthy" ~ "Node.Control",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Eliminar muestras con "Recurrence" en sample_group
+  filter(sample_group != "Recurrence")
+```
+
+Ahora se verifica que no haya ningún NA.
+
+```{r verificar NA}
+table(pdata$sample_group, useNA = "ifany")
+
+```
+
+A continuación se eliminan las muestras que no se han empleado del objeto `expr_data`.
+
+```{r filtrar muestras}
+expr_data <- expr_data[, colnames(expr_data) %in% rownames(pdata)]
+
+```
+
+# Análisis Diferencial
+
+Para identificar los genes diferencialmente expresados entre los distintos tipos de muestra del melanoma (tumor primario, metastásico y tejido normal), se utilizó el paquete **limma** de R. Este método aplica un modelo lineal a los datos de expresión normalizados (transformados a escala log₂) y emplea un enfoque empírico bayesiano para moderar las varianzas genéticas, aumentando la potencia estadística.
+
+En este caso, se construyó una **matriz de diseño** basada en la variable clínica `sample_group` y se definió un contraste entre **controles**, **muestras metastásicas y tumores primarios**. El análisis permitió obtener una lista de genes con diferencias significativas en los niveles de expresión, filtrados por un valor ajustado de *p* (\< 0.05) y un cambio en la expresión absoluto mayor a 1 en log₂ (*\|logFC\| \> 1*).
+
+```{r normalización OPCIONAL}
+
+dge <- DGEList(counts = expr_data)
+expr_data_log <- cpm(dge, log=TRUE, prior.count=1)
+
+```
+
+A continuación, se diseñan los grupos para las comparaciones. Este bloque de codigo deberá modificarse de acuerdo al tipo de muestras con las que se esté trabajando.
+
+```{r diseño de grupos}
+
+group <- factor(pdata$sample_group, levels = c("Primary.Tumor", "Metastatic", "Skin.Control", "Node.Control"))
+
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+```
+
+Seguidamente, se designan los contrastes de las hipotesis, que también deberán modificarse de estar trabajando con otras muestras.
+
+```{r contrastes}
+
+contrast.matrix <- makeContrasts(
+  Met_vs_Tumor = Metastatic - Primary.Tumor,
+  Tumor_vs_Control =Primary.Tumor - Skin.Control,
+  Met_vs_NodeControl = Metastatic - Node.Control,
+  levels = design
+)
+
+```
+
+```{r limma}
+
+fit <- lmFit(expr_data_log, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+topTable(fit2, coef="Met_vs_Tumor", number=20) # Modificar dependiendo de la comparación
+```
+
+```{r resultados}
+
+topTable(fit2, coef="Tumor_vs_Control", number=20) # Modificar dependiendo de la comparación
+```
+
+A continuación se crea un objeto con los resultados de todas las comparaciones, será necesario modificar los coeficientes (`coef`) y la comparación (`comparison`).
+
+```{r objetos de resultados}
+
+# Metastasis vs Tumor
+res_met_vs_tumor <- topTable(fit2, coef="Met_vs_Tumor", number=Inf) %>%
+  mutate(Comparison = "Met_vs_Tumor")
+
+# Control vs Tumor
+res_control_vs_tumor <- topTable(fit2, coef="Tumor_vs_Control", number=Inf) %>%
+  mutate(Comparison = "Tumor_vs_Control")
+
+# Node Control vs Met
+res_node_vs_met <- topTable(fit2, coef="Met_vs_NodeControl", number=Inf) %>%
+  mutate(Comparison = "Met_vs_NodeControl")
+
+
+```
+
+Ahora se filtran los genes para descartar los no significantes.
+
+```{r filtrado}
+
+# Metastasis vs Tumor
+res_met_vs_tumor_filtered <- res_met_vs_tumor %>%
+  filter(abs(logFC) >= 1, adj.P.Val < 0.05)
+
+# Control vs Tumor
+res_tumor_vs_control_filtered <- res_control_vs_tumor %>%
+  filter(abs(logFC) >= 1, adj.P.Val < 0.05)
+
+# Node Control vs Tumor
+res_met_vs_node_filtered <- res_node_vs_met %>%
+  filter(abs(logFC) >= 1, adj.P.Val < 0.05)
+```
+
+Finalmente, se fusionan los dos objetos de resultados para gener uno solo.
+
+```{r objeto conjunto}
+
+res_met_vs_tumor_filtered <- rownames_to_column(res_met_vs_tumor_filtered, "Gene")
+
+res_tumor_vs_control_filtered <- rownames_to_column(res_tumor_vs_control_filtered, "Gene")
+
+res_met_vs_node_filtered <- rownames_to_column(res_met_vs_node_filtered, "Gene")
+
+all_results <- bind_rows(
+  res_met_vs_tumor_filtered,
+  res_tumor_vs_control_filtered,
+  res_met_vs_node_filtered
+)
+
+```
+
+# Información adicional
+
+## Añadir columna con el tipo de cáncer
+
+A continuación, se añadirá una columna con el tipo de cáncer, con el fin de poder agrupar los resultados de distintos tipos de cáncer en un mismo archivo. Actualmente, la aplicación **Gene Searcher** trabaja con archivos separados para cada tipo de cáncer, por lo que no es estrictamente necesario ejecutar este bloque. No obstante, es recomendable incluir esta columna para mantener identificados los datos, especialmente en caso de que el archivo guardado no tenga el nombre correcto.
+
+```{r tipo de cancer}
+
+all_results$cancer_type <- "Melanoma"
+
+```
+
+## Añadir columnas con información estadística.
+
+En esta sección se incorporarán dos columnas adicionales al *data frame* de resultados, que representarán la media de expresión de cada gen en tumores primarios y metastásicos. Esta información permitirá a Gene Searcher generar gráficos comparativos de expresión para genes individuales.
+
+### Estadísticos con los datos Log2 normalizados
+
+```{r}
+
+expr_data_log <- expr_data_log[ , !(colnames(expr_data_log) %in% c("Gene", "gene_name")) ]
+
+# Verificar coincidencia
+ncol(expr_data_log)
+nrow(pdata)
+
+# Si los genes están como rownames en expr_data:
+genes_in_expr <- rownames(expr_data_log)
+
+# Filtrar expr_data para quedarse solo con los genes presentes en all_results
+expr_subset <- expr_data_log[rownames(expr_data_log) %in% all_results$Gene, , drop = FALSE]
+
+# Verificar que los nombres de genes estén alineados
+expr_subset <- expr_subset[match(all_results$Gene, rownames(expr_subset)), , drop = FALSE]
+```
+
+#### Cálculo de la media
+
+```{r media}
+
+all_results$expr_tumor_mean <- rowMeans(expr_subset[, pdata$sample_group == "Primary.Tumor", drop = FALSE], na.rm = TRUE)
+
+all_results$expr_met_mean <- rowMeans(expr_subset[, pdata$sample_group == "Metastatic", drop = FALSE], na.rm = TRUE)
+
+all_results$expr_control_mean <- rowMeans(expr_subset[, pdata$sample_group == "Skin.Control", drop = FALSE], na.rm = TRUE)
+
+all_results$expr_nodecontrol_mean <- rowMeans(expr_subset[, pdata$sample_group == "Node.Control", drop = FALSE], na.rm = TRUE)
+
+```
+
+#### Cálculo de la mediana
+
+```{r mediana}
+
+all_results$expr_tumor_median <- apply(expr_subset[, pdata$sample_group == "Primary.Tumor", drop = FALSE], 1, median, na.rm = TRUE)
+
+all_results$expr_met_median <- apply(expr_subset[, pdata$sample_group == "Metastatic", drop = FALSE], 1, median, na.rm = TRUE)
+
+all_results$expr_control_median <- apply(expr_subset[, pdata$sample_group == "Skin.Control", drop = FALSE], 1, median, na.rm = TRUE)
+
+all_results$expr_nodecontrol_median <- apply(expr_subset[, pdata$sample_group == "Node.Control", drop = FALSE], 1, median, na.rm = TRUE)
+```
+
+#### Cálculo de la desviación estándar
+
+```{r sd}
+
+all_results$expr_tumor_sd <- apply(expr_subset[, pdata$sample_group == "Primary.Tumor", drop = FALSE], 1, sd, na.rm = TRUE)
+
+all_results$expr_met_sd <- apply(expr_subset[, pdata$sample_group == "Metastatic", drop = FALSE], 1, sd, na.rm = TRUE)
+
+all_results$expr_control_sd <- apply(expr_subset[, pdata$sample_group == "Skin.Control", drop = FALSE], 1, sd, na.rm = TRUE)
+
+all_results$expr_nodecontrol_sd <- apply(expr_subset[, pdata$sample_group == "Node.Control", drop = FALSE], 1, sd, na.rm = TRUE)
+
+```
+
+### Calcular métricas estadísticas con conteos crudos
+
+En caso de tener la matriz de conteos crudos se puede ejecutar esta sección para tener también las estadísticas con los conteos crudos.
+
+```{r}
+
+expr_data <- expr_data[ , !(colnames(expr_data) %in% c("Gene", "gene_name")) ]
+
+expr_data <- expr_data[, rownames(pdata)]
+
+
+# Verificar coincidencia
+ncol(expr_data)
+nrow(pdata)
+
+# Si los genes están como rownames en expr_data:
+genes_in_expr <- rownames(expr_data)
+
+# Filtrar expr_data para quedarte solo con los genes presentes en all_results
+expr_subset <- expr_data[rownames(expr_data) %in% all_results$Gene, , drop = FALSE]
+
+# Verificar que los nombres de genes estén alineados
+expr_subset <- expr_subset[match(all_results$Gene, rownames(expr_subset)), , drop = FALSE]
+```
+
+```{r media}
+
+all_results$raw_expr_tumor_mean <- rowMeans(expr_subset[, pdata$sample_group == "Primary.Tumor", drop = FALSE], na.rm = TRUE)
+
+all_results$raw_expr_met_mean <- rowMeans(expr_subset[, pdata$sample_group == "Metastatic", drop = FALSE], na.rm = TRUE)
+
+all_results$raw_expr_control_mean <- rowMeans(expr_subset[, pdata$sample_group == "Skin.Control", drop = FALSE], na.rm = TRUE)
+
+all_results$raw_expr_nodecontrol_mean <- rowMeans(expr_subset[, pdata$sample_group == "Node.Control", drop = FALSE], na.rm = TRUE)
+
+```
+
+```{r mediana}
+
+all_results$raw_expr_tumor_median <- apply(expr_subset[, pdata$sample_group == "Primary.Tumor", drop = FALSE], 1, median, na.rm = TRUE)
+
+all_results$raw_expr_met_median <- apply(expr_subset[, pdata$sample_group == "Metastatic", drop = FALSE], 1, median, na.rm = TRUE)
+
+all_results$raw_expr_control_median <- apply(expr_subset[, pdata$sample_group == "Skin.Control", drop = FALSE], 1, median, na.rm = TRUE)
+
+all_results$raw_expr_nodecontrol_median <- apply(expr_subset[, pdata$sample_group == "Node.Control", drop = FALSE], 1, median, na.rm = TRUE)
+
+```
+
+```{r sd}
+
+all_results$raw_expr_tumor_sd <- apply(expr_subset[, pdata$sample_group == "Primary.Tumor", drop = FALSE], 1, sd, na.rm = TRUE)
+
+all_results$raw_expr_met_sd <- apply(expr_subset[, pdata$sample_group == "Metastatic", drop = FALSE], 1, sd, na.rm = TRUE)
+
+all_results$raw_expr_control_sd <- apply(expr_subset[, pdata$sample_group == "Skin.Control", drop = FALSE], 1, sd, na.rm = TRUE)
+
+all_results$raw_expr_nodecontrol_sd <- apply(expr_subset[, pdata$sample_group == "Node.Control", drop = FALSE], 1, sd, na.rm = TRUE)
+
+```
+
+## Añadir Ensembl ID
+
+Como se está trabajando con símbolos de los genes, será necesario añadir una columna con el mapeo a su ID de Ensembl.
+
+```{r}
+
+# Obtener equivalencias desde org.Hs.eg.db
+
+mapping <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = all_results$Gene,
+  columns = c("ENSEMBL", "SYMBOL"),
+  keytype = "SYMBOL"
+)
+mapping <- mapping %>%
+  distinct(SYMBOL, .keep_all = TRUE)
+
+```
+
+```{r}
+
+# Unir y reordenar
+all_results <- left_join(all_results, mapping, by = c("Gene" = "SYMBOL"))
+
+
+```
+
+```{r}
+
+all_results <- all_results %>%
+  relocate(ENSEMBL, .after = Gene)
+
+```
+
+# Anotación de los genes:
+
+En este bloque se recuperan e integran distintas capas de anotación funcional para los genes identificados en el análisis. A partir de los identificadores ENSEMBL presentes en `all_results`, se obtienen desde **org.Hs.eg.db** los símbolos, nombres de genes y rutas disponibles en la base de datos. También se extraen los identificadores **Entrez**, necesarios para consultar posteriormente las vías de Reactome. Una vez obtenidas estas anotaciones básicas, se incorporan al marco de datos original mediante un *left join*, manteniendo únicamente las columnas necesarias. Adicionalmente, se descargan las anotaciones de **Gene Ontology (GO)** asociadas a cada gen, así como las rutas de **Reactome**, utilizando los identificadores Entrez correspondientes. En conjunto, esta sección prepara todas las fuentes de información que luego serán combinadas para construir una tabla de anotaciones completa y coherente para cada gen.
+
+```{r}
+
+genes <- all_results$ENSEMBL  
+
+```
+
+```{r}
+
+annotations <- AnnotationDbi::select(org.Hs.eg.db,
+                                     keys = genes,
+                                     keytype = "ENSEMBL", #modificar si se está trabajando con otro tipo de keytype
+                                     columns = c("SYMBOL", "GENENAME", "PATH"))
+
+reactome_ann_genes <- AnnotationDbi::select( org.Hs.eg.db,
+                                       keys =  genes,
+                                       keytype =  "ENSEMBL",
+                                       columns = c("ENTREZID")
+                                       )
+
+
+# unir las anotaciones al dataframe original
+all_results_annot <- all_results %>%
+  left_join(annotations, by = c("ENSEMBL" = "ENSEMBL"))
+
+
+```
+
+```{r}
+
+all_results_annot$SYMBOL <- NULL
+
+```
+
+```{r}
+
+# GO annotation
+go_ann <- AnnotationDbi::select(org.Hs.eg.db,
+                                keys = genes,
+                                keytype = "ENSEMBL",
+                                columns = c("GO", "ONTOLOGY"))
+
+# Reactome
+reactome_ann <- AnnotationDbi::select(reactome.db,
+                                      keys = reactome_ann_genes$ENTREZID,
+                                      keytype = "ENTREZID",
+                                      columns = c("PATHNAME"))
+
+
+```
+
+## Asignar Pathway:
+
+En esta sección se construye una tabla de anotaciones génicas integrando información procedente de distintas fuentes. Primero se genera una base con las correspondencias entre identificadores ENSEMBL, símbolos génicos y nombres descriptivos. Luego se agregan las anotaciones de Gene Ontology, combinando los términos y ontologías asociados a cada gen. Posteriormente se incorporan las rutas de Reactome, enlazando identificadores ENSEMBL con sus correspondientes ID de Entrez y resumiendo los nombres de las vías en las que participa cada gen. Finalmente, todas estas capas de información se integran en una tabla unificada (`annot_final`), que proporciona una vista consolidada de las principales anotaciones funcionales para cada gen analizado.
+
+```{r}
+
+# Unir SYMBOL + GENENAME
+annot_base <- annotations %>%
+  dplyr::select(ENSEMBL, SYMBOL, GENENAME) %>%
+  dplyr::distinct()
+
+# Añadir GO
+annot_go <- go_ann %>%
+  group_by(ENSEMBL) %>%
+  summarize(
+    GO_terms = paste(unique(GO), collapse = "; "),
+    GO_ontology = paste(unique(ONTOLOGY), collapse = "; "),
+    .groups = "drop"
+  )
+
+annot_base <- annot_base %>%
+  left_join(annot_go, by = "ENSEMBL")
+
+# Añadir Reactome
+annot_reactome <- reactome_ann %>%
+  group_by(ENTREZID) %>%
+  summarize(
+    Reactome_PATH = paste(unique(PATHNAME), collapse = "; "),
+    .groups = "drop"
+  )
+
+# Unir mediante ENTREZID → ENSEMBL
+reactome_full <- reactome_ann_genes %>%
+  dplyr::select(ENSEMBL, ENTREZID) %>%
+  dplyr::distinct() %>%
+  left_join(annot_reactome, by = "ENTREZID") %>%
+  dplyr::select(-ENTREZID)
+
+# Juntar todo en una tabla final
+annot_final <- annot_base %>%
+  left_join(reactome_full, by = "ENSEMBL")
+
+# Vista previa
+head(annot_final)
+
+```
+
+Ahora se elimina la columna del id del path.
+
+```{r}
+
+# Primero merge con las anotaciones
+all_results$ENSEMBL <- sub("\\..*$", "", all_results$ENSEMBL)
+
+res_mer <- merge(all_results, annot_final, by = "ENSEMBL", all.x = TRUE)
+
+# Ahora se condensan las columnas de anotación sin perder las de res
+res_mer_unique <- res_mer %>%
+  group_by(ENSEMBL) %>%
+  summarize(
+    # conservar columnas numéricas (logFC, pvalue, etc.)
+    across(where(is.numeric), dplyr::first),
+
+    # conservar columnas no numéricas de all_results
+    Comparison = dplyr::first(Comparison),
+    cancer_type = dplyr::first(cancer_type),
+
+    # columnas de anotación
+    SYMBOL = unique(SYMBOL)[1],
+    GENENAME = unique(GENENAME)[1],
+
+    GO_terms = paste(unique(GO_terms[!is.na(GO_terms)]), collapse = "; "),
+    GO_ontology = paste(unique(GO_ontology[!is.na(GO_ontology)]), collapse = "; "),
+    Reactome_PATH = paste(unique(Reactome_PATH[!is.na(Reactome_PATH)]), collapse = "; "),
+
+    .groups = "drop"
+  ) %>%
+  as.data.frame() %>%
+  rename(Gene = SYMBOL)
+
+# Verificar
+head(res_mer_unique)
+```
+
+## Guardar el objeto:
+
+Finalmente se guardará `res_mer_unique` como un objecto R para poder acceder comodamente y seguir añadiendo información.
+
+```{r}
+
+ saveRDS(res_mer_unique, file = "results_GEO_Melanoma.rds")
+ 
+ # Si se quiere guardar el dataset para que este disponible en Gene Search, cambiar el tipo de cáncer de acuerdo al dataset con el que se esté trabajando
+saveRDS(res_mer_unique, file = "./Gene_Searcher/data_Melanoma_Geo.rds")
+```
